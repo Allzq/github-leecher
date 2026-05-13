@@ -99,19 +99,27 @@ jobs:
           echo "URL count: ${total}"
           cat -n urls.txt
 
-      - name: Install 7z and dependencies
+      - name: Install basic tools
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y p7zip-full lib32gcc-s1 curl
 
-      - name: Install steamcmd manually (Ubuntu 24.04 fix)
+      - name: Install steamcmd (official method)
         run: |
-          cd /usr/local
-          sudo curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" | sudo tar zxvf -
-          sudo chmod 755 /usr/local/steamcmd/steamcmd.sh
-          echo '/usr/local/steamcmd' >> $GITHUB_PATH
-          # اولین اجرا برای به‌روزرسانی خود steamcmd
-          steamcmd.sh +quit
+          # Download to temp
+          curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" -o /tmp/steamcmd.tar.gz
+          # Create directory
+          sudo mkdir -p /usr/local/steamcmd
+          # Extract
+          sudo tar -xzf /tmp/steamcmd.tar.gz -C /usr/local/steamcmd
+          # Set executable
+          sudo chmod +x /usr/local/steamcmd/steamcmd.sh
+          # Add to PATH for this job
+          echo "/usr/local/steamcmd" >> $GITHUB_PATH
+          # Verify installation
+          ls -la /usr/local/steamcmd/
+          # First run to auto-update
+          /usr/local/steamcmd/steamcmd.sh +quit
 
       - name: Download all files (supports Workshop & direct URLs)
         id: download_files
@@ -122,7 +130,7 @@ jobs:
           success=0
           APPID="${{ github.event.inputs.steam_appid }}"
 
-          # تابع برای دانلود از ورکشاپ و برگرداندن نام مد
+          # Workshop download function (safe path)
           download_workshop() {
             local url="$1"
             local mod_id
@@ -138,20 +146,21 @@ jobs:
             echo "📥 Downloading Workshop mod $mod_id (AppID: $APPID) ..."
             mkdir -p workshop_temp
             cd workshop_temp
-            # اجرای steamcmd با مسیر کامل برای اطمینان
+            # Use full path to steamcmd
             /usr/local/steamcmd/steamcmd.sh +force_install_dir ./ +login anonymous +workshop_download_item "$APPID" "$mod_id" +quit
             if [ $? -ne 0 ]; then
               cd ..
               echo "❌ SteamCMD download failed for $mod_id"
               return 1
             fi
-            # پیدا کردن محتوای دانلود شده
+            # Locate downloaded content
             CONTENT_PATH=""
-            if [ -d "workshop/content/$APPID/$mod_id" ]; then
+            if [ -d "steamapps/workshop/content/$APPID/$mod_id" ]; then
+              CONTENT_PATH="steamapps/workshop/content/$APPID/$mod_id"
+            elif [ -d "workshop/content/$APPID/$mod_id" ]; then
               CONTENT_PATH="workshop/content/$APPID/$mod_id"
             else
-              # جستجوی کلی
-              CONTENT_PATH=$(find . -type f -name "*.vpk" -o -name "*.png" -o -name "*.bin" | head -1 | xargs dirname 2>/dev/null)
+              CONTENT_PATH=$(find . -type d -name "$mod_id" | grep -v "^\./steamapps" | head -1)
             fi
             if [ -z "$CONTENT_PATH" ] || [ ! -d "$CONTENT_PATH" ]; then
               cd ..
@@ -159,20 +168,19 @@ jobs:
               return 1
             fi
             MOD_NAME=$(basename "$CONTENT_PATH")
-            # اگر نام پوشه همان id عددی است، سعی می‌کنیم از فایل description نام را بگیریم
+            # Try to get real mod name from description file
             if [[ "$MOD_NAME" =~ ^[0-9]+$ ]]; then
               if [ -f "$CONTENT_PATH/description.txt" ]; then
                 MOD_NAME=$(head -1 "$CONTENT_PATH/description.txt" | sed 's/[^a-zA-Z0-9._-]/_/g')
               else
-                MOD_NAME="workshop_item_$mod_id"
+                MOD_NAME="workshop_${mod_id}"
               fi
             fi
             cd ..
-            # کپی کردن محتوا به پوشه files با نام مناسب
             mkdir -p "files/$MOD_NAME"
             cp -r "workshop_temp/$CONTENT_PATH"/* "files/$MOD_NAME/" 2>/dev/null || cp -r "workshop_temp/$CONTENT_PATH" "files/$MOD_NAME"
             rm -rf workshop_temp
-            echo "✅ Workshop download completed: $MOD_NAME"
+            echo "✅ Workshop download: $MOD_NAME"
             echo "$MOD_NAME"
             return 0
           }
@@ -186,12 +194,11 @@ jobs:
               MOD_NAME=$(download_workshop "$url")
               if [ $? -eq 0 ] && [ -d "files/$MOD_NAME" ]; then
                 success=$((success + 1))
-                echo "WORKSHOP_DOWNLOADED_$counter=$MOD_NAME" >> $GITHUB_ENV
               else
                 echo "❌ Workshop download failed for $url"
               fi
             else
-              # دانلود مستقیم فایل
+              # Direct URL download
               FILENAME_FROM_URL=$(echo "$url" | sed 's/?.*//' | xargs basename)
               if [ -z "$FILENAME_FROM_URL" ]; then
                 FILENAME_FROM_URL="unknown_${counter}"
@@ -208,7 +215,6 @@ jobs:
               else
                 DL_NAME="${PREFIX}_${FILENAME_BASE}"
               fi
-              # محدودیت طول نام
               MAXLEN=50
               if [ ${#DL_NAME} -gt $MAXLEN ]; then
                 DL_NAME="${DL_NAME:0:$MAXLEN}"
@@ -246,7 +252,7 @@ jobs:
           echo "Split size: ${SPLIT_MB}MB"
 
           processed=0
-          # فایل‌های معمولی
+          # Regular files
           for file in files/*; do
             [ -f "$file" ] || continue
             processed=$((processed + 1))
@@ -256,13 +262,12 @@ jobs:
             else
               7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/$(basename "$file").7z" "$file"
             fi
-            # اگر فقط یک تکه بود، پسوند .001 را حذف کن
             if [ -f "${FOLDER}/$(basename "$file").7z.001" ] && [ ! -f "${FOLDER}/$(basename "$file").7z.002" ]; then
               mv "${FOLDER}/$(basename "$file").7z.001" "${FOLDER}/$(basename "$file").7z"
             fi
           done
 
-          # پوشه‌های مدهای ورکشاپ
+          # Workshop mod folders
           for dir in files/*/; do
             [ -d "$dir" ] || continue
             modname=$(basename "$dir")
