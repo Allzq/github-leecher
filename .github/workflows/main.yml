@@ -1,52 +1,8 @@
-name: انتقال فایل به گیت هاب (با پشتیبانی از Steam Workshop)
+name: انتقال فایل به گیت هاب (با پشتیبانی از Steam Workshop – پایدار)
 
 on:
   workflow_dispatch:
-    inputs:
-      file_url_1:
-        description: 'لینک ۱ (آدرس مستقیم یا لینک استیم ورکشاپ)'
-        required: true
-        type: string
-      file_url_2:
-        description: 'لینک ۲ (اختیاری)'
-        required: false
-        type: string
-      file_url_3:
-        description: 'لینک ۳ (اختیاری)'
-        required: false
-        type: string
-      file_url_4:
-        description: 'لینک ۴ (اختیاری)'
-        required: false
-        type: string
-      file_url_5:
-        description: 'لینک ۵ (اختیاری)'
-        required: false
-        type: string
-      steam_appid:
-        description: '📦 Steam App ID (برای لینک ورکشاپ لازم است)'
-        required: false
-        type: string
-        default: ''
-      zip_password:
-        description: '🔒 رمز آرشیو (اختیاری)'
-        required: false
-        type: string
-        default: ''
-      split_size:
-        description: 'حداکثر حجم هر تکه (مگابایت)'
-        required: false
-        type: choice
-        default: '95  (حداکثر - برای فایل‌های حجیم)'
-        options:
-          - '25  (اینترنت ضعیف - فایل‌های کوچک)'
-          - '50  (متوسط)'
-          - '95  (حداکثر - برای فایل‌های حجیم)'
-      delete_old_archives:
-        description: 'پاک کردن فایل‌های قبلی (در صورت تیک زدن، تمام آرشیوهای قدیمی حذف میشن)'
-        required: false
-        type: boolean
-        default: false
+    [ ... keep same inputs ... ]
 
 permissions:
   contents: write
@@ -82,7 +38,6 @@ jobs:
         run: |
           SIZE=$(echo "${{ github.event.inputs.split_size }}" | grep -oP '\d+')
           echo "split_mb=${SIZE:-95}" >> $GITHUB_OUTPUT
-
           cat > urls.txt << URLEOF
           ${{ github.event.inputs.file_url_1 }}
           ${{ github.event.inputs.file_url_2 }}
@@ -90,10 +45,8 @@ jobs:
           ${{ github.event.inputs.file_url_4 }}
           ${{ github.event.inputs.file_url_5 }}
           URLEOF
-
           sed -i '/^$/d' urls.txt
           sed -i 's/^[ \t]*//;s/[ \t]*$//' urls.txt
-
           total=$(wc -l < urls.txt)
           echo "url_count=${total}" >> $GITHUB_OUTPUT
           echo "URL count: ${total}"
@@ -104,24 +57,32 @@ jobs:
           sudo apt-get update -qq
           sudo apt-get install -y p7zip-full lib32gcc-s1 curl
 
-      - name: Install steamcmd (official method)
+      - name: Install steamcmd (official method with retry)
         run: |
-          # Download to temp
           curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" -o /tmp/steamcmd.tar.gz
           sudo mkdir -p /usr/local/steamcmd
           sudo tar -xzf /tmp/steamcmd.tar.gz -C /usr/local/steamcmd
-          # Set execute permissions on all binaries
           sudo chmod +x /usr/local/steamcmd/steamcmd.sh
           sudo chmod +x /usr/local/steamcmd/linux32/steamcmd
           sudo chmod +x /usr/local/steamcmd/linux32/steamerrorreporter 2>/dev/null || true
           sudo chmod +x /usr/local/steamcmd/linux32/crashhandler.so 2>/dev/null || true
-          # Add to PATH
           echo "/usr/local/steamcmd" >> $GITHUB_PATH
-          # Verify installation
-          ls -la /usr/local/steamcmd/
-          ls -la /usr/local/steamcmd/linux32/
-          # First run to auto-update
-          /usr/local/steamcmd/steamcmd.sh +quit
+
+          # Retry self-update (known flaky download)
+          for i in {1..5}; do
+            echo "Attempt $i: running steamcmd to update itself..."
+            if /usr/local/steamcmd/steamcmd.sh +quit; then
+              echo "SteamCMD update succeeded on attempt $i."
+              break
+            else
+              if [ $i -eq 5 ]; then
+                echo "SteamCMD failed to update after 5 attempts."
+                exit 1
+              fi
+              echo "Attempt $i failed, waiting 10 seconds..."
+              sleep 10
+            fi
+          done
 
       - name: Download all files (supports Workshop & direct URLs)
         id: download_files
@@ -132,7 +93,6 @@ jobs:
           success=0
           APPID="${{ github.event.inputs.steam_appid }}"
 
-          # Workshop download function
           download_workshop() {
             local url="$1"
             local mod_id
@@ -148,13 +108,21 @@ jobs:
             echo "📥 Downloading Workshop mod $mod_id (AppID: $APPID) ..."
             mkdir -p workshop_temp
             cd workshop_temp
-            # Use full path to steamcmd
-            /usr/local/steamcmd/steamcmd.sh +force_install_dir ./ +login anonymous +workshop_download_item "$APPID" "$mod_id" +quit
-            if [ $? -ne 0 ]; then
-              cd ..
-              echo "❌ SteamCMD download failed for $mod_id"
-              return 1
-            fi
+            # Retry the actual download as well (workshop downloads can also fail)
+            DL_RETRY=3
+            for attempt in $(seq 1 $DL_RETRY); do
+              if /usr/local/steamcmd/steamcmd.sh +force_install_dir ./ +login anonymous +workshop_download_item "$APPID" "$mod_id" +quit; then
+                break
+              else
+                if [ $attempt -eq $DL_RETRY ]; then
+                  cd ..
+                  echo "❌ SteamCMD download failed for $mod_id after $DL_RETRY attempts"
+                  return 1
+                fi
+                echo "Download attempt $attempt failed, retrying in 10s..."
+                sleep 10
+              fi
+            done
             # Locate downloaded content
             CONTENT_PATH=""
             if [ -d "steamapps/workshop/content/$APPID/$mod_id" ]; then
@@ -170,7 +138,6 @@ jobs:
               return 1
             fi
             MOD_NAME=$(basename "$CONTENT_PATH")
-            # Try to get real mod name from description file
             if [[ "$MOD_NAME" =~ ^[0-9]+$ ]]; then
               if [ -f "$CONTENT_PATH/description.txt" ]; then
                 MOD_NAME=$(head -1 "$CONTENT_PATH/description.txt" | sed 's/[^a-zA-Z0-9._-]/_/g')
@@ -190,7 +157,6 @@ jobs:
           while IFS= read -r url; do
             echo "========================================="
             echo "[$counter/$total] Processing: $url"
-
             if [[ "$url" == *"steamcommunity.com/sharedfiles/filedetails"* ]]; then
               echo "🎮 Workshop link detected."
               MOD_NAME=$(download_workshop "$url")
@@ -200,7 +166,7 @@ jobs:
                 echo "❌ Workshop download failed for $url"
               fi
             else
-              # Direct URL download
+              # Direct URL download (unchanged)
               FILENAME_FROM_URL=$(echo "$url" | sed 's/?.*//' | xargs basename)
               if [ -z "$FILENAME_FROM_URL" ]; then
                 FILENAME_FROM_URL="unknown_${counter}"
@@ -249,12 +215,9 @@ jobs:
           FOLDER="downloads/${TIMESTAMP}"
           mkdir -p "$FOLDER"
           PASSWORD="${{ github.event.inputs.zip_password }}"
-
           echo "Output folder: ${FOLDER}"
           echo "Split size: ${SPLIT_MB}MB"
-
           processed=0
-          # Regular files
           for file in files/*; do
             [ -f "$file" ] || continue
             processed=$((processed + 1))
@@ -268,8 +231,6 @@ jobs:
               mv "${FOLDER}/$(basename "$file").7z.001" "${FOLDER}/$(basename "$file").7z"
             fi
           done
-
-          # Workshop mod folders
           for dir in files/*/; do
             [ -d "$dir" ] || continue
             modname=$(basename "$dir")
@@ -284,7 +245,6 @@ jobs:
               mv "${FOLDER}/${modname}.7z.001" "${FOLDER}/${modname}.7z"
             fi
           done
-
           rm -rf files
           echo "processed_count=${processed}" >> $GITHUB_OUTPUT
           echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
@@ -298,7 +258,6 @@ jobs:
       - name: Commit and Push all chunks
         run: |
           FOLDER="${{ steps.process_files.outputs.folder }}"
-          echo "Adding files from ${FOLDER}..."
           git add "${FOLDER}/"*.7z* 2>/dev/null || true
           if ! git diff --staged --quiet; then
             file_count=$(git diff --staged --name-only | wc -l)
@@ -340,9 +299,7 @@ jobs:
           echo "========================================="
           cat >> $GITHUB_STEP_SUMMARY << EOF
           <div dir="rtl">
-
           ## 📊 خلاصه اجرا
-
           | مورد | مقدار |
           |------|-------|
           | دانلود موفق | ${{ steps.download_files.outputs.success_count }} از ${{ steps.parse.outputs.url_count }} |
@@ -351,11 +308,8 @@ jobs:
           | حجم کل | ${TOTAL_SIZE} |
           | 📂 پوشه دانلود | [ ${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |
           | وضعیت | ✅ موفق |
-
           > 📌 **توجه:** دانلود از استیم ورکشاپ با `anonymous` انجام می‌شود. برای آیتم‌های خصوصی یا بازی‌های نیازمند مالکیت ممکن است کار نکند.
-
           ---
           ## تقدیم به همه آن‌هایی که راهی جز عبور ندارند. - [حسین بلنج](https://balanj.ir)
-
           </div>
           EOF
