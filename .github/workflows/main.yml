@@ -1,41 +1,40 @@
-name: انتقال فایل به گیت هاب
+name: انتقال فایل به گیت هاب (با پشتیبانی از Steam Workshop)
 
 on:
   workflow_dispatch:
     inputs:
       file_url_1:
-        description: 'لینک ۱ (الزامی)'
+        description: 'لینک ۱ (آدرس مستقیم یا لینک استیم ورکشاپ)'
         required: true
         type: string
-        default: ''
       file_url_2:
         description: 'لینک ۲ (اختیاری)'
         required: false
         type: string
-        default: ''
       file_url_3:
         description: 'لینک ۳ (اختیاری)'
         required: false
         type: string
-        default: ''
       file_url_4:
         description: 'لینک ۴ (اختیاری)'
         required: false
         type: string
-        default: ''
       file_url_5:
         description: 'لینک ۵ (اختیاری)'
         required: false
         type: string
+      steam_appid:
+        description: '📦 Steam App ID (در صورت استفاده از لینک ورکشاپ لازم است)'
+        required: false
+        type: string
         default: ''
       zip_password:
-        description: '🔒 تعیین رمز برای فایل آرشیو'
+        description: '🔒 رمز آرشیو (اختیاری)'
         required: false
         type: string
         default: ''
       split_size:
-        description: |
-          حداکثر حجم هر تکه (مگابایت)
+        description: 'حداکثر حجم هر تکه (مگابایت)'
         required: false
         type: choice
         default: '95  (حداکثر - برای فایل‌های حجیم)'
@@ -100,69 +99,136 @@ jobs:
           echo "URL count: ${total}"
           cat -n urls.txt
 
-      - name: Install 7z
+      - name: Install tools (7z + steamcmd)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y p7zip-full
+          # نصب steamcmd
+          sudo add-apt-repository multiverse -y
+          sudo apt-get update -qq
+          echo steamcmd steam/question select "I AGREE" | sudo debconf-set-selections
+          echo steamcmd steam/license note '' | sudo debconf-set-selections
+          sudo apt-get install -y steamcmd
 
-      - name: Download all files
+      - name: Download all files (supports Workshop & direct URLs)
         id: download_files
         run: |
           mkdir -p files
           total=${{ steps.parse.outputs.url_count }}
           counter=1
           success=0
+          APPID="${{ github.event.inputs.steam_appid }}"
+
+          # تابع برای دانلود از ورکشاپ
+          download_workshop() {
+            local url="$1"
+            local mod_id
+            mod_id=$(echo "$url" | grep -oP '(?<=id=)[0-9]+')
+            if [ -z "$mod_id" ]; then
+              echo "❌ Could not extract Workshop ID from: $url"
+              return 1
+            fi
+            if [ -z "$APPID" ]; then
+              echo "❌ Steam App ID not provided. Cannot download workshop item."
+              return 1
+            fi
+            echo "📥 Downloading Workshop mod $mod_id (AppID: $APPID) ..."
+            mkdir -p workshop_temp
+            cd workshop_temp
+            steamcmd +force_install_dir ./ +login anonymous +workshop_download_item "$APPID" "$mod_id" +quit
+            if [ $? -ne 0 ]; then
+              cd ..
+              echo "❌ SteamCMD download failed for $mod_id"
+              return 1
+            fi
+            # پیدا کردن پوشه دانلود شده (معمولاً بر اساس نام مد)
+            DOWNLOAD_PATH=$(find . -type d -name "$mod_id" -prune -o -type f -print | head -1)
+            if [ -z "$DOWNLOAD_PATH" ]; then
+              # معمولاً steamcmd محتوا را در workshop/content/<appid>/<mod_id>/ می‌گذارد
+              if [ -d "workshop/content/$APPID/$mod_id" ]; then
+                DOWNLOAD_PATH="workshop/content/$APPID/$mod_id"
+              else
+                DOWNLOAD_PATH=$(find . -name "*.png" -o -name "*.bin" | head -1 | xargs dirname 2>/dev/null)
+              fi
+            fi
+            if [ -z "$DOWNLOAD_PATH" ]; then
+              cd ..
+              echo "❌ Could not locate downloaded workshop content"
+              return 1
+            fi
+            MOD_NAME=$(basename "$DOWNLOAD_PATH")
+            # اگر نام پوشه همان ID عددی است، سعی می‌کنیم از فایل description یا page HTML نام را بگیریم
+            if [[ "$MOD_NAME" =~ ^[0-9]+$ ]]; then
+              # تلاش برای خواندن عنوان از فایل description.txt (برخی مدها)
+              if [ -f "$DOWNLOAD_PATH/description.txt" ]; then
+                MOD_NAME=$(head -1 "$DOWNLOAD_PATH/description.txt" | sed 's/[^a-zA-Z0-9._-]/_/g')
+              else
+                MOD_NAME="workshop_item_$mod_id"
+              fi
+            fi
+            cd ..
+            echo "Mod name: $MOD_NAME"
+            # کپی کردن محتوا به پوشه files با نام مناسب
+            cp -r "workshop_temp/$DOWNLOAD_PATH"/* "files/$MOD_NAME" 2>/dev/null || cp -r "workshop_temp/$DOWNLOAD_PATH" "files/$MOD_NAME"
+            rm -rf workshop_temp
+            echo "✅ Workshop download completed: $MOD_NAME"
+            echo "$MOD_NAME"
+            return 0
+          }
 
           while IFS= read -r url; do
             echo "========================================="
-            echo "[$counter/$total] Downloading: $url"
+            echo "[$counter/$total] Processing: $url"
 
-            FILENAME_FROM_URL=$(echo "$url" | sed 's/?.*//' | xargs basename)
-            if [ -z "$FILENAME_FROM_URL" ]; then
-              FILENAME_FROM_URL="unknown_${counter}"
-            fi
-
-            FILENAME_BASE="${FILENAME_FROM_URL%.*}"
-            FILENAME_EXT="${FILENAME_FROM_URL##*.}"
-            if [ "$FILENAME_BASE" = "$FILENAME_FROM_URL" ]; then
-              FILENAME_EXT=""
-            fi
-
-            PREFIX="sci-hub.ir"
-
-            if [ "$total" -gt 1 ]; then
-              NUM=$(printf '%02d' $counter)
-              DL_NAME="${PREFIX}_${NUM}_${FILENAME_BASE}"
-            else
-              DL_NAME="${PREFIX}_${FILENAME_BASE}"
-            fi
-
-            MAXLEN=50
-            if [ ${#DL_NAME} -gt $MAXLEN ]; then
-              if [ "$total" -gt 1 ]; then
-                KEEP=$((MAXLEN - ${#PREFIX} - 4))
+            FINAL_FILENAME=""
+            if [[ "$url" == *"steamcommunity.com/sharedfiles/filedetails"* ]]; then
+              echo "🎮 Workshop link detected."
+              MOD_NAME=$(download_workshop "$url")
+              if [ $? -eq 0 ] && [ -d "files/$MOD_NAME" ]; then
+                # اگر دانلود موفق بود، یک فایل فشرده را بعداً می‌سازیم؛ اینجا فقط نام را ثبت می‌کنیم
+                FINAL_FILENAME="$MOD_NAME"
+                echo "WORKSHOP_DOWNLOADED_$counter=$MOD_NAME" >> $GITHUB_ENV
+                success=$((success + 1))
               else
-                KEEP=$((MAXLEN - ${#PREFIX} - 1))
+                echo "❌ Workshop download failed for $url"
               fi
-              DL_NAME="${DL_NAME:0:$MAXLEN}"
-            fi
-
-            if [ -n "$FILENAME_EXT" ]; then
-              FINAL_FILENAME="${DL_NAME}.${FILENAME_EXT}"
             else
-              FINAL_FILENAME="${DL_NAME}"
+              # دانلود مستقیم فایل
+              FILENAME_FROM_URL=$(echo "$url" | sed 's/?.*//' | xargs basename)
+              if [ -z "$FILENAME_FROM_URL" ]; then
+                FILENAME_FROM_URL="unknown_${counter}"
+              fi
+              FILENAME_BASE="${FILENAME_FROM_URL%.*}"
+              FILENAME_EXT="${FILENAME_FROM_URL##*.}"
+              if [ "$FILENAME_BASE" = "$FILENAME_FROM_URL" ]; then
+                FILENAME_EXT=""
+              fi
+              PREFIX="sci-hub.ir"
+              if [ "$total" -gt 1 ]; then
+                NUM=$(printf '%02d' $counter)
+                DL_NAME="${PREFIX}_${NUM}_${FILENAME_BASE}"
+              else
+                DL_NAME="${PREFIX}_${FILENAME_BASE}"
+              fi
+              # محدودیت طول نام
+              MAXLEN=50
+              if [ ${#DL_NAME} -gt $MAXLEN ]; then
+                DL_NAME="${DL_NAME:0:$MAXLEN}"
+              fi
+              if [ -n "$FILENAME_EXT" ]; then
+                FINAL_FILENAME="${DL_NAME}.${FILENAME_EXT}"
+              else
+                FINAL_FILENAME="${DL_NAME}"
+              fi
+              echo "Download filename: ${FINAL_FILENAME}"
+              if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "files/${FINAL_FILENAME}" "$url"; then
+                size=$(ls -lh "files/${FINAL_FILENAME}" | awk '{print $5}')
+                echo "✅ Downloaded: ${FINAL_FILENAME} ($size)"
+                success=$((success + 1))
+              else
+                echo "❌ Failed: $url"
+              fi
             fi
-
-            echo "Download filename: ${FINAL_FILENAME}"
-
-            if curl -L --fail --retry 5 --retry-delay 10 --connect-timeout 30 -o "files/${FINAL_FILENAME}" "$url"; then
-              size=$(ls -lh "files/${FINAL_FILENAME}" | awk '{print $5}')
-              echo "Downloaded: ${FINAL_FILENAME} ($size)"
-              success=$((success + 1))
-            else
-              echo "Failed: $url"
-            fi
-
             counter=$((counter + 1))
           done < urls.txt
 
@@ -181,34 +247,42 @@ jobs:
           echo "Output folder: ${FOLDER}"
           echo "Split size: ${SPLIT_MB}MB"
 
-          counter=0
-
+          processed=0
+          # ابتدا فایل‌های معمولی
           for file in files/*; do
             [ -f "$file" ] || continue
-            counter=$((counter + 1))
-
-            echo "========================================="
-            echo "Processing: $(basename "$file")"
-
-            FILENAME=$(basename "$file")
-
+            processed=$((processed + 1))
+            echo "Archiving: $(basename "$file")"
             if [ "${#PASSWORD}" -gt 0 ]; then
-              7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "${FOLDER}/${FILENAME}.7z" "$file"
+              7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "${FOLDER}/$(basename "$file").7z" "$file"
             else
-              7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/${FILENAME}.7z" "$file"
+              7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/$(basename "$file").7z" "$file"
             fi
+            # حذف فایل تکی اگر تنها یک تکه بود
+            if [ -f "${FOLDER}/$(basename "$file").7z.001" ] && [ ! -f "${FOLDER}/$(basename "$file").7z.002" ]; then
+              mv "${FOLDER}/$(basename "$file").7z.001" "${FOLDER}/$(basename "$file").7z"
+            fi
+          done
 
-            if [ -f "${FOLDER}/${FILENAME}.7z.001" ] && [ ! -f "${FOLDER}/${FILENAME}.7z.002" ]; then
-              mv "${FOLDER}/${FILENAME}.7z.001" "${FOLDER}/${FILENAME}.7z"
-              echo "Single chunk"
+          # سپس پوشه‌های حاصل از ورکشاپ
+          for dir in files/*/; do
+            [ -d "$dir" ] || continue
+            modname=$(basename "$dir")
+            processed=$((processed + 1))
+            echo "Archiving workshop mod: $modname"
+            # فشرده‌سازی کل پوشه مد
+            if [ "${#PASSWORD}" -gt 0 ]; then
+              7z a -p"$PASSWORD" -mhe=on -mx=3 -v${SPLIT_MB}m "${FOLDER}/${modname}.7z" "$dir"
             else
-              echo "Multiple chunks"
+              7z a -mx=3 -v${SPLIT_MB}m "${FOLDER}/${modname}.7z" "$dir"
+            fi
+            if [ -f "${FOLDER}/${modname}.7z.001" ] && [ ! -f "${FOLDER}/${modname}.7z.002" ]; then
+              mv "${FOLDER}/${modname}.7z.001" "${FOLDER}/${modname}.7z"
             fi
           done
 
           rm -rf files
-
-          echo "processed_count=${counter}" >> $GITHUB_OUTPUT
+          echo "processed_count=${processed}" >> $GITHUB_OUTPUT
           echo "folder=${FOLDER}" >> $GITHUB_OUTPUT
 
       - name: Configure Git
@@ -220,22 +294,16 @@ jobs:
       - name: Commit and Push all chunks
         run: |
           FOLDER="${{ steps.process_files.outputs.folder }}"
-
           echo "Adding files from ${FOLDER}..."
           git add "${FOLDER}/"*.7z* 2>/dev/null || true
-
           if ! git diff --staged --quiet; then
             file_count=$(git diff --staged --name-only | wc -l)
-            git commit -m "Add ${{ steps.process_files.outputs.processed_count }} file(s) in ${FOLDER} (${file_count} chunks)"
-            echo "Committed $file_count files."
-
+            git commit -m "Add ${{ steps.process_files.outputs.processed_count }} item(s) in ${FOLDER} (${file_count} chunks)"
             push_success=false
             max_attempts=15
-
             for attempt in $(seq 1 $max_attempts); do
               echo "Push attempt $attempt of $max_attempts..."
               git pull --rebase origin main 2>/dev/null || true
-
               if git push origin main; then
                 echo "Push successful on attempt $attempt."
                 push_success=true
@@ -245,7 +313,6 @@ jobs:
                 sleep 20
               fi
             done
-
             if [ "$push_success" = false ]; then
               echo "Push failed after $max_attempts attempts."
               exit 1
@@ -258,18 +325,15 @@ jobs:
         run: |
           FOLDER="${{ steps.process_files.outputs.folder }}"
           TOTAL_SIZE=$(du -sh "$FOLDER" 2>/dev/null | awk '{print $1}')
-          if [ -z "$TOTAL_SIZE" ]; then TOTAL_SIZE="N/A"; fi
-
           echo ""
           echo "========================================="
           echo "Job completed!"
           echo "Downloaded: ${{ steps.download_files.outputs.success_count }} / ${{ steps.parse.outputs.url_count }}"
-          echo "Processed: ${{ steps.process_files.outputs.processed_count }} file(s)"
+          echo "Processed: ${{ steps.process_files.outputs.processed_count }} item(s)"
           echo "Split size: ${{ steps.parse.outputs.split_mb }}MB"
           echo "Folder: $FOLDER"
           echo "Total size: ${TOTAL_SIZE}"
           echo "========================================="
-
           cat >> $GITHUB_STEP_SUMMARY << EOF
           <div dir="rtl">
 
@@ -278,14 +342,16 @@ jobs:
           | مورد | مقدار |
           |------|-------|
           | دانلود موفق | ${{ steps.download_files.outputs.success_count }} از ${{ steps.parse.outputs.url_count }} |
-          | فایل پردازش شده | ${{ steps.process_files.outputs.processed_count }} عدد |
+          | فایل/آیتم پردازش شده | ${{ steps.process_files.outputs.processed_count }} عدد |
           | حداکثر حجم هر تکه | ${{ steps.parse.outputs.split_mb }} مگابایت |
           | حجم کل | ${TOTAL_SIZE} |
           | 📂 پوشه دانلود | [ ${FOLDER}](https://github.com/${{ github.repository }}/tree/main/${FOLDER}) |
           | وضعیت | ✅ موفق |
 
-           ---
+          > 📌 **توجه:** دانلود از استیم ورکشاپ نیاز به `Steam App ID` دارد و ممکن است برای برخی بازی‌ها به احراز هویت نیاز باشد. در این صورت آن آيتم قابل دانلود نیست.
+
+          ---
           ## تقدیم به همه آن‌هایی که راهی جز عبور ندارند. - [حسین بلنج](https://balanj.ir)
-                   
+
           </div>
           EOF
