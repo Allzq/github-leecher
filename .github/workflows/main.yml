@@ -108,16 +108,18 @@ jobs:
         run: |
           # Download to temp
           curl -sqL "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz" -o /tmp/steamcmd.tar.gz
-          # Create directory
           sudo mkdir -p /usr/local/steamcmd
-          # Extract
           sudo tar -xzf /tmp/steamcmd.tar.gz -C /usr/local/steamcmd
-          # Set executable
+          # Set execute permissions on all binaries
           sudo chmod +x /usr/local/steamcmd/steamcmd.sh
-          # Add to PATH for this job
+          sudo chmod +x /usr/local/steamcmd/linux32/steamcmd
+          sudo chmod +x /usr/local/steamcmd/linux32/steamerrorreporter 2>/dev/null || true
+          sudo chmod +x /usr/local/steamcmd/linux32/crashhandler.so 2>/dev/null || true
+          # Add to PATH
           echo "/usr/local/steamcmd" >> $GITHUB_PATH
           # Verify installation
           ls -la /usr/local/steamcmd/
+          ls -la /usr/local/steamcmd/linux32/
           # First run to auto-update
           /usr/local/steamcmd/steamcmd.sh +quit
 
@@ -130,7 +132,7 @@ jobs:
           success=0
           APPID="${{ github.event.inputs.steam_appid }}"
 
-          # Workshop download function (safe path)
+          # Workshop download function
           download_workshop() {
             local url="$1"
             local mod_id
